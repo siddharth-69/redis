@@ -2287,6 +2287,8 @@ void RM_SetModuleAttribs(RedisModuleCtx *ctx, const char *name, int ver, int api
     module->options = 0;
     module->info_cb = 0;
     module->defrag_cb = 0;
+    module->defrag_start_cb = 0;
+    module->defrag_end_cb = 0;
     module->loadmod = NULL;
     module->num_commands_with_acl_categories = 0;
     module->onload = 1;
@@ -4068,7 +4070,8 @@ static void moduleInitKeyTypeSpecific(RedisModuleKey *key) {
  * * REDISMODULE_OPEN_KEY_NONOTIFY - Don't trigger keyspace event on key misses.
  * * REDISMODULE_OPEN_KEY_NOSTATS - Don't update keyspace hits/misses counters.
  * * REDISMODULE_OPEN_KEY_NOEXPIRE - Avoid deleting lazy expired keys.
- * * REDISMODULE_OPEN_KEY_NOEFFECTS - Avoid any effects from fetching the key. */
+ * * REDISMODULE_OPEN_KEY_NOEFFECTS - Avoid any effects from fetching the key.
+ * * REDISMODULE_OPEN_KEY_ACCESS_EXPIRED - Access expired keys that have not yet been deleted */
 RedisModuleKey *RM_OpenKey(RedisModuleCtx *ctx, robj *keyname, int mode) {
     RedisModuleKey *kp;
     robj *value;
@@ -4078,6 +4081,7 @@ RedisModuleKey *RM_OpenKey(RedisModuleCtx *ctx, robj *keyname, int mode) {
     flags |= (mode & REDISMODULE_OPEN_KEY_NOSTATS? LOOKUP_NOSTATS: 0);
     flags |= (mode & REDISMODULE_OPEN_KEY_NOEXPIRE? LOOKUP_NOEXPIRE: 0);
     flags |= (mode & REDISMODULE_OPEN_KEY_NOEFFECTS? LOOKUP_NOEFFECTS: 0);
+    flags |= (mode & REDISMODULE_OPEN_KEY_ACCESS_EXPIRED ? (LOOKUP_ACCESS_EXPIRED) : 0);
 
     if (mode & REDISMODULE_WRITE) {
         value = lookupKeyWriteWithFlags(ctx->client->db,keyname, flags);
@@ -4274,7 +4278,7 @@ int RM_SetAbsExpire(RedisModuleKey *key, mstime_t expire) {
 void RM_ResetDataset(int restart_aof, int async) {
     if (restart_aof && server.aof_state != AOF_OFF) stopAppendOnly();
     flushAllDataAndResetRDB((async? EMPTYDB_ASYNC: EMPTYDB_NO_FLAGS) | EMPTYDB_NOFUNCTIONS);
-    if (server.aof_enabled && restart_aof) restartAOFAfterSYNC();
+    if (server.aof_enabled && restart_aof) startAppendOnlyWithRetry();
 }
 
 /* Returns the number of keys in the current db. */
@@ -5375,6 +5379,9 @@ int RM_HashGet(RedisModuleKey *key, int flags, ...) {
     int hfeFlags = HFE_LAZY_AVOID_FIELD_DEL | HFE_LAZY_AVOID_HASH_DEL;
     va_list ap;
     if (key->value && key->value->type != OBJ_HASH) return REDISMODULE_ERR;
+
+    if (key->mode & REDISMODULE_OPEN_KEY_ACCESS_EXPIRED)
+        hfeFlags = HFE_LAZY_ACCESS_EXPIRED; /* allow read also expired fields */
 
     va_start(ap, flags);
     while(1) {
@@ -11085,8 +11092,9 @@ static void moduleScanKeyCallback(void *privdata, const dictEntry *de) {
     } else if (o->type == OBJ_HASH) {
         sds val = dictGetVal(de);
 
-        /* If field is expired, then ignore */
-        if (hfieldIsExpired(key))
+        /* If field is expired and not indicated to access expired, then ignore */
+        if ((!(data->key->mode & REDISMODULE_OPEN_KEY_ACCESS_EXPIRED)) &&
+            (hfieldIsExpired(key)))
             return;
 
         field = createStringObject(key, hfieldlen(key));
@@ -11222,7 +11230,8 @@ int RM_ScanKey(RedisModuleKey *key, RedisModuleScanCursor *cursor, RedisModuleSc
                 p = lpNext(lp, p);
 
                 /* Skip expired fields */
-                if (hashTypeIsExpired(o, vllExpire))
+                if ((!(key->mode & REDISMODULE_OPEN_KEY_ACCESS_EXPIRED)) &&
+                    (hashTypeIsExpired(o, vllExpire)))
                     continue;
             }
 
@@ -12463,10 +12472,15 @@ void modulePipeReadable(aeEventLoop *el, int fd, void *privdata, int mask) {
 /* Helper function for the MODULE and HELLO command: send the list of the
  * loaded modules to the client. */
 void addReplyLoadedModules(client *c) {
+    const long ln = dictSize(modules);
+    /* In case no module is load we avoid iterator creation */
+    addReplyArrayLen(c,ln);
+    if (ln == 0) {
+        return;
+    }
     dictIterator *di = dictGetIterator(modules);
     dictEntry *de;
 
-    addReplyArrayLen(c,dictSize(modules));
     while ((de = dictNext(di)) != NULL) {
         sds name = dictGetKey(de);
         struct RedisModule *module = dictGetVal(de);
@@ -13070,7 +13084,7 @@ int RM_RdbLoad(RedisModuleCtx *ctx, RedisModuleRdbStream *stream, int flags) {
     int ret = rdbLoad(stream->data.filename,NULL,RDBFLAGS_NONE);
 
     if (server.current_client) unprotectClient(server.current_client);
-    if (server.aof_state != AOF_OFF) startAppendOnly();
+    if (server.aof_enabled) startAppendOnlyWithRetry();
 
     if (ret != RDB_OK) {
         errno = (ret == RDB_NOT_EXIST) ? ENOENT : EIO;
@@ -13451,6 +13465,16 @@ int RM_RegisterDefragFunc(RedisModuleCtx *ctx, RedisModuleDefragFunc cb) {
     return REDISMODULE_OK;
 }
 
+/* Register a defrag callbacks that will be called when defrag operation starts and ends.
+ *
+ * The callbacks are the same as `RM_RegisterDefragFunc` but the user
+ * can also assume the callbacks are called when the defrag operation starts and ends. */
+int RM_RegisterDefragCallbacks(RedisModuleCtx *ctx, RedisModuleDefragFunc start, RedisModuleDefragFunc end) {
+    ctx->module->defrag_start_cb = start;
+    ctx->module->defrag_end_cb = end;
+    return REDISMODULE_OK;
+}
+
 /* When the data type defrag callback iterates complex structures, this
  * function should be called periodically. A zero (false) return
  * indicates the callback may continue its work. A non-zero value (true)
@@ -13527,6 +13551,30 @@ int RM_DefragCursorGet(RedisModuleDefragCtx *ctx, unsigned long *cursor) {
 void *RM_DefragAlloc(RedisModuleDefragCtx *ctx, void *ptr) {
     UNUSED(ctx);
     return activeDefragAlloc(ptr);
+}
+
+/* Allocate memory for defrag purposes
+ *
+ * On the common cases user simply want to reallocate a pointer with a single
+ * owner. For such usecase RM_DefragAlloc is enough. But on some usecases the user
+ * might want to replace a pointer with multiple owners in different keys.
+ * In such case, an in place replacement can not work because the other key still
+ * keep a pointer to the old value. 
+ * 
+ * RM_DefragAllocRaw and RM_DefragFreeRaw allows to control when the memory
+ * for defrag purposes will be allocated and when it will be freed,
+ * allow to support more complex defrag usecases. */
+void *RM_DefragAllocRaw(RedisModuleDefragCtx *ctx, size_t size) {
+    UNUSED(ctx);
+    return activeDefragAllocRaw(size);
+}
+
+/* Free memory for defrag purposes
+ * 
+ * See RM_DefragAllocRaw for more information. */
+void RM_DefragFreeRaw(RedisModuleDefragCtx *ctx, void *ptr) {
+    UNUSED(ctx);
+    activeDefragFreeRaw(ptr);
 }
 
 /* Defrag a RedisModuleString previously allocated by RM_Alloc, RM_Calloc, etc.
@@ -13610,17 +13658,32 @@ int moduleDefragValue(robj *key, robj *value, int dbid) {
 
 /* Call registered module API defrag functions */
 void moduleDefragGlobals(void) {
-    dictIterator *di = dictGetIterator(modules);
-    dictEntry *de;
+    dictForEach(modules, struct RedisModule, module, 
+        if (module->defrag_cb) {
+            RedisModuleDefragCtx defrag_ctx = { 0, NULL, NULL, -1};
+            module->defrag_cb(&defrag_ctx);
+        }
+    );
+}
 
-    while ((de = dictNext(di)) != NULL) {
-        struct RedisModule *module = dictGetVal(de);
-        if (!module->defrag_cb)
-            continue;
-        RedisModuleDefragCtx defrag_ctx = { 0, NULL, NULL, -1};
-        module->defrag_cb(&defrag_ctx);
-    }
-    dictReleaseIterator(di);
+/* Call registered module API defrag start functions */
+void moduleDefragStart(void) {
+    dictForEach(modules, struct RedisModule, module, 
+        if (module->defrag_start_cb) {
+            RedisModuleDefragCtx defrag_ctx = { 0, NULL, NULL, -1};
+            module->defrag_start_cb(&defrag_ctx);
+        }
+    );
+}
+
+/* Call registered module API defrag end functions */
+void moduleDefragEnd(void) {
+    dictForEach(modules, struct RedisModule, module, 
+        if (module->defrag_end_cb) {
+            RedisModuleDefragCtx defrag_ctx = { 0, NULL, NULL, -1};
+            module->defrag_end_cb(&defrag_ctx);
+        }
+    );
 }
 
 /* Returns the name of the key currently being processed.
@@ -13980,7 +14043,10 @@ void moduleRegisterCoreAPI(void) {
     REGISTER_API(GetCurrentCommandName);
     REGISTER_API(GetTypeMethodVersion);
     REGISTER_API(RegisterDefragFunc);
+    REGISTER_API(RegisterDefragCallbacks);
     REGISTER_API(DefragAlloc);
+    REGISTER_API(DefragAllocRaw);
+    REGISTER_API(DefragFreeRaw);
     REGISTER_API(DefragRedisModuleString);
     REGISTER_API(DefragShouldStop);
     REGISTER_API(DefragCursorSet);
